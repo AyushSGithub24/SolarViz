@@ -3,8 +3,9 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SolarViz</title>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.3/leaflet.css" />
+  <title>Mapbox with Accurate Solar Information</title>
+  <script src='https://api.mapbox.com/mapbox-gl-js/v2.14.1/mapbox-gl.js'></script>
+  <link href='https://api.mapbox.com/mapbox-gl-js/v2.14.1/mapbox-gl.css' rel='stylesheet' />
   <style>
     body, html {
       height: 100%;
@@ -70,18 +71,39 @@
     </div>
   </div>
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.3/leaflet.js"></script>
   <script>
     const SOLAR_CONSTANT = 1361; // W/m²
     const STEFAN_BOLTZMANN = 5.67e-8; // W/(m²·K⁴)
     const EARTH_AVG_TEMP = 288; // K
 
-    var map = L.map('map');
+    mapboxgl.accessToken = 'pk.eyJ1IjoicHJha2hhcmNvZGVyIiwiYSI6ImNtMTJuaXlxejBuNXUycXMxZm1jN3Zta3oifQ.7Ij-92TgqY-flciWlEBX7Q'; // Replace with your Mapbox access token
+    var map = new mapboxgl.Map({
+      container: 'map',
+      style: 'mapbox://styles/mapbox/streets-v11',
+      center: [-0.09, 51.505], // Default center (will be updated with user's location)
+      zoom: 13
+    });
+
     var marker;
 
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-    }).addTo(map);
+    // Function to initialize the map with user's location
+    function initializeMap() {
+      if ("geolocation" in navigator) {
+        navigator.geolocation.getCurrentPosition(function(position) {
+          const lat = position.coords.latitude;
+          const lng = position.coords.longitude;
+          map.setCenter([lng, lat]);
+          updateMarker(lat, lng);
+        }, function(error) {
+          console.error("Error getting user's location:", error);
+        });
+      } else {
+        console.log("Geolocation is not available in this browser.");
+      }
+    }
+
+    // Call initializeMap when the map has finished loading
+    map.on('load', initializeMap);
 
     function updateCoordinates(lat, lng) {
       document.getElementById('lat').textContent = lat.toFixed(6);
@@ -90,9 +112,12 @@
 
     async function fetchAltitude(lat, lng) {
       try {
-        const response = await fetch(`https://api.open-elevation.com/api/v1/lookup?locations=${lat},${lng}`);
+        const url = `https://api.open-meteo.com/v1/elevation?latitude=${lat}&longitude=${lng}`;
+        console.log('Fetching altitude from:', url);
+        const response = await fetch(url);
         const data = await response.json();
-        return data.results[0].elevation;
+        console.log('Altitude data:', data);
+        return data.elevation[0];
       } catch (error) {
         console.error('Error fetching altitude:', error);
         return null;
@@ -149,30 +174,20 @@
       const pressure = 101325 * Math.pow(1 - 2.25577e-5 * altitude, 5.25588);
       const m = am * pressure / 101325;
 
-      // Direct Normal Irradiance
       const dni = SOLAR_CONSTANT * Math.exp(-0.8662 * m * 0.095);
-
-      // Diffuse Horizontal Irradiance
       const dhi = SOLAR_CONSTANT * 0.2710 - 0.2939 * dni;
-
-      // Global Horizontal Irradiance
       const ghi = dni * Math.cos(θz) + dhi;
 
       return { dni, dhi, ghi };
     }
 
     function estimateTemperature(ghi, altitude) {
-      // Simple energy balance model
       const albedo = 0.3;
       const emissivity = 0.95;
       const absorbed = ghi * (1 - albedo);
       const emitted = STEFAN_BOLTZMANN * Math.pow(EARTH_AVG_TEMP, 4);
       const netEnergy = absorbed - emitted;
-
-      // Temperature change based on net energy (simplified)
-      const tempChange = netEnergy / (1000 * 4186); // Assuming 1m depth of water
-      
-      // Base temperature estimation using standard lapse rate
+      const tempChange = netEnergy / (1000 * 4186);
       const baseTemp = 20 - (altitude * 0.0065);
 
       return baseTemp + tempChange;
@@ -184,13 +199,14 @@
 
     async function updateMarker(lat, lng) {
       if (marker) {
-        map.removeLayer(marker);
+        marker.remove();
       }
-      marker = L.marker([lat, lng]).addTo(map);
-      map.setView([lat, lng], 13);
+      marker = new mapboxgl.Marker().setLngLat([lng, lat]).addTo(map);
+      map.flyTo({center: [lng, lat], zoom: 13});
       updateCoordinates(lat, lng);
 
       const altitude = await fetchAltitude(lat, lng);
+      console.log('Fetched altitude:', altitude);
       document.getElementById('altitude').textContent = altitude !== null ? `${altitude.toFixed(2)} meters` : 'N/A';
 
       const sunTimes = await fetchSunTimes(lat, lng);
@@ -199,110 +215,58 @@
       if (sunTimes) {
         const sunrise = new Date(sunTimes.sunrise);
         const sunset = new Date(sunTimes.sunset);
-        const { elevation, azimuth } = calculateSolarPosition(lat, lng, now);
-        const { dni, dhi, ghi } = calculateSolarIrradiance(elevation, altitude);
-        const temperature = estimateTemperature(ghi, altitude);
+        const daylight = now >= sunrise && now <= sunset;
 
+        const { elevation, azimuth } = calculateSolarPosition(lat, lng, now);
         document.getElementById('solarElevation').textContent = `${elevation.toFixed(2)}°`;
         document.getElementById('solarAzimuth').textContent = `${azimuth.toFixed(2)}°`;
+
+        const { dni, dhi, ghi } = calculateSolarIrradiance(elevation, altitude);
         document.getElementById('dni').textContent = `${dni.toFixed(2)} W/m²`;
         document.getElementById('dhi').textContent = `${dhi.toFixed(2)} W/m²`;
         document.getElementById('ghi').textContent = `${ghi.toFixed(2)} W/m²`;
-        document.getElementById('estimatedTemp').textContent = `${temperature.toFixed(2)}°C`;
 
-        const isDaytime = now > sunrise && now < sunset;
-        document.getElementById('sunlightStatus').textContent = isDaytime ? 
-          "The Sun is above the horizon (daytime)" : 
-          "The Sun is below the horizon (nighttime or twilight)";
-      } else {
-        document.getElementById('solarElevation').textContent = 'N/A';
-        document.getElementById('solarAzimuth').textContent = 'N/A';
-        document.getElementById('dni').textContent = 'N/A';
-        document.getElementById('dhi').textContent = 'N/A';
-        document.getElementById('ghi').textContent = 'N/A';
-        document.getElementById('estimatedTemp').textContent = 'N/A';
-        document.getElementById('sunlightStatus').textContent = 'Unable to determine';
+        const estimatedTemp = estimateTemperature(ghi, altitude);
+        document.getElementById('estimatedTemp').textContent = `${estimatedTemp.toFixed(2)} °C`;
+        document.getElementById('sunlightStatus').textContent = daylight ? 'Daylight' : 'Night';
       }
     }
 
-    map.on('click', function(e) {
-      updateMarker(e.latlng.lat, e.latlng.lng);
+    document.getElementById('search-input').addEventListener('input', async function() {
+      const query = this.value.toLowerCase();
+      if (query.length < 3) {
+        document.getElementById('suggestions').style.display = 'none';
+        return;
+      }
+      try {
+        const response = await fetch(`https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(query)}.json?access_token=${mapboxgl.accessToken}`);
+        const data = await response.json();
+        const suggestions = document.getElementById('suggestions');
+        suggestions.innerHTML = '';
+        data.features.forEach(place => {
+          const li = document.createElement('li');
+          li.textContent = place.place_name;
+          li.onclick = () => {
+            const [lng, lat] = place.center;
+            updateMarker(lat, lng);
+            document.getElementById('search-input').value = place.place_name;
+            suggestions.style.display = 'none';
+          };
+          suggestions.appendChild(li);
+        });
+        suggestions.style.display = data.features.length > 0 ? 'block' : 'none';
+      } catch (error) {
+        console.error('Error fetching suggestions:', error);
+      }
     });
 
-    const searchInput = document.getElementById('search-input');
-    const suggestionsList = document.getElementById('suggestions');
+    map.on('click', function(e) {
+      const lng = e.lngLat.lng;
+      const lat = e.lngLat.lat;
+      console.log('Map clicked at:', lat, lng);
+      updateMarker(lat, lng);
+    });
 
-    searchInput.addEventListener('input', debounce(handleSearch, 300));
-
-    function debounce(func, delay) {
-      let timeoutId;
-      return function (...args) {
-        clearTimeout(timeoutId);
-        timeoutId = setTimeout(() => func.apply(this, args), delay);
-      };
-    }
-
-    async function handleSearch() {
-      const query = searchInput.value.trim();
-      if (query.length < 3) {
-        suggestionsList.style.display = 'none';
-        return;
-      }
-
-      if (isCoordinates(query)) {
-        const [lat, lng] = query.split(',').map(coord => parseFloat(coord.trim()));
-        updateMarker(lat, lng);
-        suggestionsList.style.display = 'none';
-      } else {
-        try {
-          const response = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`);
-          const data = await response.json();
-          displaySuggestions(data);
-        } catch (error) {
-          console.error('Error fetching suggestions:', error);
-        }
-      }
-    }
-
-    function isCoordinates(query) {
-      const coordRegex = /^-?\d+(\.\d+)?,\s*-?\d+(\.\d+)?$/;
-      return coordRegex.test(query);
-    }
-
-    function displaySuggestions(suggestions) {
-      suggestionsList.innerHTML = '';
-      if (suggestions.length === 0) {
-        suggestionsList.style.display = 'none';
-        return;
-      }
-
-      suggestions.forEach(place => {
-        const li = document.createElement('li');
-        li.textContent = place.display_name;
-        li.addEventListener('click', () => {
-          updateMarker(parseFloat(place.lat), parseFloat(place.lon));
-          searchInput.value = place.display_name;
-          suggestionsList.style.display = 'none';
-        });
-        suggestionsList.appendChild(li);
-      });
-
-      suggestionsList.style.display = 'block';
-    }
-
-    if (navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(function (position) {
-        var lat = position.coords.latitude;
-        var lng = position.coords.longitude;
-        updateMarker(lat, lng);
-      }, function () {
-        console.warn("Geolocation is not enabled or permission was denied.");
-        updateMarker(51.505, -0.09); // Default to London coordinates
-      });
-    } else {
-      console.warn("Geolocation is not supported by this browser.");
-      updateMarker(51.505, -0.09);
-    }
   </script>
 </body>
 </html>
