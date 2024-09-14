@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenStreetMap with Accurate Solar Information</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.3/leaflet.css" />
+  <style>
+    body, html {
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      font-family: Arial, sans-serif;
+    }
+    .content {
+      display: flex;
+      height: 100%;
+    }
+    #map {
+      flex: 1;
+    }
+    #sidebar {
+      width: 300px;
+      padding: 10px;
+      background-color: #f0f0f0;
+      overflow-y: auto;
+    }
+    #search-input {
+      width: 100%;
+      padding: 5px;
+      margin-bottom: 10px;
+    }
+    #suggestions {
+      list-style-type: none;
+      padding: 0;
+      margin: 0;
+      max-height: 150px;
+      overflow-y: auto;
+      border: 1px solid #ccc;
+      display: none;
+    }
+    #suggestions li {
+      padding: 5px;
+      cursor: pointer;
+    }
+    #suggestions li:hover {
+      background-color: #e0e0e0;
+    }
+  </style>
+</head>
+<body>
+  <div class="content">
+    <div id="map"></div>
+    <div id="sidebar">
+      <h3>Search</h3>
+      <input type="text" id="search-input" placeholder="Enter coordinates or place name">
+      <ul id="suggestions"></ul>
+      <h3>Location Info</h3>
+      <p>Latitude: <span id="lat"></span></p>
+      <p>Longitude: <span id="lng"></span></p>
+      <p>Altitude: <span id="altitude"></span></p>
+      <h3>Solar Info</h3>
+      <p>Solar Elevation: <span id="solarElevation"></span></p>
+      <p>Solar Azimuth: <span id="solarAzimuth"></span></p>
+      <p>Direct Normal Irradiance: <span id="dni"></span></p>
+      <p>Diffuse Horizontal Irradiance: <span id="dhi"></span></p>
+      <p>Global Horizontal Irradiance: <span id="ghi"></span></p>
+      <p>Estimated Temperature: <span id="estimatedTemp"></span></p>
+      <p>Sunlight Status: <span id="sunlightStatus"></span></p>
+    </div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.3/leaflet.js"></script>
+  <script>
+    const SOLAR_CONSTANT = 1361; // W/m²
+    const STEFAN_BOLTZMANN = 5.67e-8; // W/(m²·K⁴)
+    const EARTH_AVG_TEMP = 288; // K
+
+    var map = L.map('map');
+    var marker;
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    }).addTo(map);
+
+    function updateCoordinates(lat, lng) {
+      document.getElementById('lat').textContent = lat.toFixed(6);
+      document.getElementById('lng').textContent = lng.toFixed(6);
+    }
+
+    async function fetchAltitude(lat, lng) {
+      try {
+        const response = await fetch(`https://api.open-elevation.com/api/v1/lookup?locations=${lat},${lng}`);
+        const data = await response.json();
+        return data.results[0].elevation;
+      } catch (error) {
+        console.error('Error fetching altitude:', error);
+        return null;
+      }
+    }
+
+    async function fetchSunTimes(lat, lng) {
+      const now = new Date();
+      const dateStr = now.toISOString().split('T')[0];
+      const url = `https://api.sunrise-sunset.org/json?lat=${lat}&lng=${lng}&date=${dateStr}&formatted=0`;
+      try {
+        const response = await fetch(url);
+        const data = await response.json();
+        return data.results;
+      } catch (error) {
+        console.error('Error fetching sun times:', error);
+        return null;
+      }
+    }
+
+    function calculateSolarPosition(lat, lng, date) {
+      const d = Math.PI / 180;
+      const radLat = lat * d;
+      const jd = getJulianDate(date);
+      const n = jd - 2451545.0;
+      const L = (280.460 + 0.9856474 * n) % 360;
+      const g = (357.528 + 0.9856003 * n) % 360;
+      const λ = L + 1.915 * Math.sin(g * d) + 0.020 * Math.sin(2 * g * d);
+      const ε = 23.439 - 0.0000004 * n;
+      const sinδ = Math.sin(ε * d) * Math.sin(λ * d);
+      const δ = Math.asin(sinδ) / d;
+      const eqtime = 229.18 * (0.000075 + 0.001868 * Math.cos(g * d) - 0.032077 * Math.sin(g * d)
+                    - 0.014615 * Math.cos(2 * g * d) - 0.040849 * Math.sin(2 * g * d));
+      const timeOffset = eqtime + 4 * lng - 60 * date.getTimezoneOffset();
+      const tst = date.getHours() * 60 + date.getMinutes() + date.getSeconds() / 60 + timeOffset;
+      const ha = (tst / 4 - 180) * d;
+
+      const cosθz = Math.sin(radLat) * sinδ + Math.cos(radLat) * Math.cos(δ) * Math.cos(ha);
+      const θz = Math.acos(cosθz) / d;
+      const elevation = 90 - θz;
+
+      const cosAz = (sinδ * Math.cos(radLat) - Math.cos(δ) * Math.sin(radLat) * Math.cos(ha)) / Math.sin(θz * d);
+      let azimuth = Math.acos(cosAz) / d;
+      if (ha > 0) {
+        azimuth = 360 - azimuth;
+      }
+
+      return { elevation, azimuth };
+    }
+
+    function calculateSolarIrradiance(elevation, altitude) {
+      const θz = (90 - elevation) * Math.PI / 180;
+      const am = 1 / (Math.cos(θz) + 0.50572 * Math.pow(96.07995 - elevation, -1.6364));
+      const pressure = 101325 * Math.pow(1 - 2.25577e-5 * altitude, 5.25588);
+      const m = am * pressure / 101325;
+
+      // Direct Normal Irradiance
+      const dni = SOLAR_CONSTANT * Math.exp(-0.8662 * m * 0.095);
+
+      // Diffuse Horizontal Irradiance
+      const dhi = SOLAR_CONSTANT * 0.2710 - 0.2939 * dni;
+
+      // Global Horizontal Irradiance
+      const ghi = dni * Math.cos(θz) + dhi;
+
+      return { dni, dhi, ghi };
+    }
+
+    function estimateTemperature(ghi, altitude) {
+      // Simple energy balance model
+      const albedo = 0.3;
+      const emissivity = 0.95;
+      const absorbed = ghi * (1 - albedo);
+      const emitted = STEFAN_BOLTZMANN * Math.pow(EARTH_AVG_TEMP, 4);
+      const netEnergy = absorbed - emitted;
+
+      // Temperature change based on net energy (simplified)
+      const tempChange = netEnergy / (1000 * 4186); // Assuming 1m depth of water
+      
+      // Base temperature estimation using standard lapse rate
+      const baseTemp = 20 - (altitude * 0.0065);
+
+      return baseTemp + tempChange;
+    }
+
+    function getJulianDate(date) {
+      return (date / 86400000) - (date.getTimezoneOffset() / 1440) + 2440587.5;
+    }
+
+    async function updateMarker(lat, lng) {
+      if (marker) {
+        map.removeLayer(marker);
+      }
+      marker = L.marker([lat, lng]).addTo(map);
+      map.setView([lat, lng], 13);
+      updateCoordinates(lat, lng);
+
+      const altitude = await fetchAltitude(lat, lng);
+      document.getElementById('altitude').textContent = altitude !== null ? `${altitude.toFixed(2)} meters` : 'N/A';
+
+      const sunTimes = await fetchSunTimes(lat, lng);
+      const now = new Date();
+      
+      if (sunTimes) {
+        const sunrise = new Date(sunTimes.sunrise);
+        const sunset = new Date(sunTimes.sunset);
+        const { elevation, azimuth } = calculateSolarPosition(lat, lng, now);
+        const { dni, dhi, ghi } = calculateSolarIrradiance(elevation, altitude);
+        const temperature = estimateTemperature(ghi, altitude);
+
+        document.getElementById('solarElevation').textContent = `${elevation.toFixed(2)}°`;
+        document.getElementById('solarAzimuth').textContent = `${azimuth.toFixed(2)}°`;
+        document.getElementById('dni').textContent = `${dni.toFixed(2)} W/m²`;
+        document.getElementById('dhi').textContent = `${dhi.toFixed(2)} W/m²`;
+        document.getElementById('ghi').textContent = `${ghi.toFixed(2)} W/m²`;
+        document.getElementById('estimatedTemp').textContent = `${temperature.toFixed(2)}°C`;
+
+        const isDaytime = now > sunrise && now < sunset;
+        document.getElementById('sunlightStatus').textContent = isDaytime ? 
+          "The Sun is above the horizon (daytime)" : 
+          "The Sun is below the horizon (nighttime or twilight)";
+      } else {
+        document.getElementById('solarElevation').textContent = 'N/A';
+        document.getElementById('solarAzimuth').textContent = 'N/A';
+        document.getElementById('dni').textContent = 'N/A';
+        document.getElementById('dhi').textContent = 'N/A';
+        document.getElementById('ghi').textContent = 'N/A';
+        document.getElementById('estimatedTemp').textContent = 'N/A';
+        document.getElementById('sunlightStatus').textContent = 'Unable to determine';
+      }
+    }
+
+    map.on('click', function(e) {
+      updateMarker(e.latlng.lat, e.latlng.lng);
+    });
+
+    const searchInput = document.getElementById('search-input');
+    const suggestionsList = document.getElementById('suggestions');
+
+    searchInput.addEventListener('input', debounce(handleSearch, 300));
+
+    function debounce(func, delay) {
+      let timeoutId;
+      return function (...args) {
+        clearTimeout(timeoutId);
+        timeoutId = setTimeout(() => func.apply(this, args), delay);
+      };
+    }
+
+    async function handleSearch() {
+      const query = searchInput.value.trim();
+      if (query.length < 3) {
+        suggestionsList.style.display = 'none';
+        return;
+      }
+
+      if (isCoordinates(query)) {
+        const [lat, lng] = query.split(',').map(coord => parseFloat(coord.trim()));
+        updateMarker(lat, lng);
+        suggestionsList.style.display = 'none';
+      } else {
+        try {
+          const response = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`);
+          const data = await response.json();
+          displaySuggestions(data);
+        } catch (error) {
+          console.error('Error fetching suggestions:', error);
+        }
+      }
+    }
+
+    function isCoordinates(query) {
+      const coordRegex = /^-?\d+(\.\d+)?,\s*-?\d+(\.\d+)?$/;
+      return coordRegex.test(query);
+    }
+
+    function displaySuggestions(suggestions) {
+      suggestionsList.innerHTML = '';
+      if (suggestions.length === 0) {
+        suggestionsList.style.display = 'none';
+        return;
+      }
+
+      suggestions.forEach(place => {
+        const li = document.createElement('li');
+        li.textContent = place.display_name;
+        li.addEventListener('click', () => {
+          updateMarker(parseFloat(place.lat), parseFloat(place.lon));
+          searchInput.value = place.display_name;
+          suggestionsList.style.display = 'none';
+        });
+        suggestionsList.appendChild(li);
+      });
+
+      suggestionsList.style.display = 'block';
+    }
+
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(function (position) {
+        var lat = position.coords.latitude;
+        var lng = position.coords.longitude;
+        updateMarker(lat, lng);
+      }, function () {
+        console.warn("Geolocation is not enabled or permission was denied.");
+        updateMarker(51.505, -0.09); // Default to London coordinates
+      });
+    } else {
+      console.warn("Geolocation is not supported by this browser.");
+      updateMarker(51.505, -0.09);
+    }
+  </script>
+</body>
+</html>
